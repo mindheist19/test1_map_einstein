@@ -1,0 +1,244 @@
+# %% markdown
+# # Named Entity Recognition with Conditional Random Fields
+# %% markdown
+# One of the classic challenges of Natural Language Processing is sequence labelling. In sequence labelling, the goal is to label each word in a text with a word class. In part-of-speech tagging, these word classes are parts of speech, such as noun or verb. In named entity recognition (NER), they're types of generic named entities, such as locations, people or organizations, or more specialized entities, such as diseases or symptoms in the healthcare domain. In this way, sequence labelling can help us extract the most important information from a text and improve the performance of analytics, search or matching applications.
+# %% markdown
+# In this notebook we'll explore Conditional Random Fields, the most popular approach to sequence labelling before Deep Learning arrived. Deep Learning may get all the attention right now, but Conditional Random Fields are still a powerful tool to build a simple sequence labeller.
+#
+# The tool we're going to use is `sklearn-crfsuite`. This is a wrapper around `python-crfsuite`, which itself is a Python binding of [CRFSuite](http://www.chokkan.org/software/crfsuite/). The reason we're using `sklearn-crfsuite` is that it provides a number of handy utility functions, for example for evaluating the output of the model. You can install it with `pip install sklearn-crfsuite`.
+# %% markdown
+# ## Data
+# %% markdown
+# First we get some data. A well-known data set for training and testing NER models is the CoNLL-2002 data, which has Spanish and Dutch texts labelled with four types of entities: locations (LOC), persons (PER), organizations (ORG) and miscellaneous entities (MISC). Both corpora are split up in three portions: a training portion and two smaller test portions, one of which we'll use as development data. It's easy to collect the data from NLTK.
+# %% codecell
+import nltk
+import sklearn
+from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.preprocessing import LabelBinarizer
+import sklearn_crfsuite as crfsuite
+from sklearn_crfsuite import metrics
+# %% codecell
+train_sents = list(nltk.corpus.conll2002.iob_sents('ned.train'))
+dev_sents = list(nltk.corpus.conll2002.iob_sents('ned.testa'))
+test_sents = list(nltk.corpus.conll2002.iob_sents('ned.testb'))
+# %% markdown
+# The data consists of a list of tokenized sentences. For each of the tokens we have the string itself, its part-of-speech tag and its entity tag, which follows the BIO convention. In the deep learning world we live in today, it's common to ignore the part-of-speech tags. However, since CRFs rely on good feature extraction, we'll gladly make use of this information. After all, the part of speech of a word tells us a lot about its possible status as a named entity: nouns will more often be entities than verbs, for example.
+# %% codecell
+train_sents[0]
+# %% markdown
+# ## Feature Extraction
+# %% markdown
+# Whereas today neural networks are expected to learn the relevant features of the input texts themselves, this is very different with Conditional Random Fields. CRFs learn the relationship between the features we give them and the label of a token in a given context. They're not going to earn these features themselves. Instead, the quality of the model will depend highly on the relevance of the features we show it.
+#
+# The most important method in this tutorial is therefore the one that collects the features for every token. What information could be useful? The word itself, of course, together with its part of speech tag. It can also be interesting to know whether the word is completely uppercase, whether it starts with a capital or is a digit. In addition, we also take a look at the character bigram and trigram the word ends with. We also give every token a `bias` feature, which always has the same value. This bias feature helps the CRF learn the relative frequency of each label type in the training data.
+#
+# To give the CRF more information about the meaning of a word, we also introduce information from word embeddings. In our [Word Embedding notebook](https://github.com/nlptown/nlp-notebooks/blob/master/An%20Introduction%20to%20Word%20Embeddings.ipynb), we trained word embeddings on Dutch Wikipedia and clustered them in 500 clusters. Here we'll read these 500 clusters from a file, and map each word to the id of the cluster it is in. This is really useful for Named Entity Recognition, as most entity types cluster together. This allows CRFs to generalize above the word level. For example, when the CRF encounters a word it has never seen (say, *Albania*), it can base its decision on the cluster the word is in. If this cluster contains many other entities the CRF has met in its training data (say, *Italy*, *Germany* and *France*), it will have learnt a string link between this cluster and a specific entity type. As a result, it can still assign that entity type to the unknown word. In our experiments, this feature alone boosts the performance with around 3%.
+#
+# Finally, apart from the token itself, we also want the CRF to look at its context. More specifically, we're going to give it some extra information about the two words to the left and the right of the targt word. We'll tell the CRF what these words are, whether they start with a capital or are completely uppercase, and give it their part-of-speech tag. If there is no left or right context, we'll inform the CRF that the token is at the beginning or end of the sentence (`BOS` or `EOS`).
+# %% codecell
+def read_clusters(cluster_file):
+    word2cluster = {}
+    with open(cluster_file) as i:
+        for line in i:
+            word, cluster = line.strip().split('\t')
+            word2cluster[word] = cluster
+    return word2cluster
+
+
+def word2features(sent, i, word2cluster):
+    word = sent[i][0]
+    postag = sent[i][1]
+    features = [
+        'bias',
+        'word.lower=' + word.lower(),
+        'word[-3:]=' + word[-3:],
+        'word[-2:]=' + word[-2:],
+        'word.isupper=%s' % word.isupper(),
+        'word.istitle=%s' % word.istitle(),
+        'word.isdigit=%s' % word.isdigit(),
+        'word.cluster=%s' % word2cluster[word.lower()] if word.lower() in word2cluster else "0",
+        'postag=' + postag
+    ]
+    if i > 0:
+        word1 = sent[i-1][0]
+        postag1 = sent[i-1][1]
+        features.extend([
+            '-1:word.lower=' + word1.lower(),
+            '-1:word.istitle=%s' % word1.istitle(),
+            '-1:word.isupper=%s' % word1.isupper(),
+            '-1:postag=' + postag1
+        ])
+    else:
+        features.append('BOS')
+
+    if i > 1:
+        word2 = sent[i-2][0]
+        postag2 = sent[i-2][1]
+        features.extend([
+            '-2:word.lower=' + word2.lower(),
+            '-2:word.istitle=%s' % word2.istitle(),
+            '-2:word.isupper=%s' % word2.isupper(),
+            '-2:postag=' + postag2
+        ])
+
+
+    if i < len(sent)-1:
+        word1 = sent[i+1][0]
+        postag1 = sent[i+1][1]
+        features.extend([
+            '+1:word.lower=' + word1.lower(),
+            '+1:word.istitle=%s' % word1.istitle(),
+            '+1:word.isupper=%s' % word1.isupper(),
+            '+1:postag=' + postag1
+        ])
+    else:
+        features.append('EOS')
+
+    if i < len(sent)-2:
+        word2 = sent[i+2][0]
+        postag2 = sent[i+2][1]
+        features.extend([
+            '+2:word.lower=' + word2.lower(),
+            '+2:word.istitle=%s' % word2.istitle(),
+            '+2:word.isupper=%s' % word2.isupper(),
+            '+2:postag=' + postag2
+        ])
+
+
+    return features
+
+
+def sent2features(sent, word2cluster):
+    return [word2features(sent, i, word2cluster) for i in range(len(sent))]
+
+def sent2labels(sent):
+    return [label for token, postag, label in sent]
+
+def sent2tokens(sent):
+    return [token for token, postag, label in sent]
+
+word2cluster = read_clusters("data/embeddings/clusters_nl.tsv")
+# %% codecell
+sent2features(train_sents[0], word2cluster)[0]
+# %% codecell
+X_train = [sent2features(s, word2cluster) for s in train_sents]
+y_train = [sent2labels(s) for s in train_sents]
+
+X_dev = [sent2features(s, word2cluster) for s in dev_sents]
+y_dev = [sent2labels(s) for s in dev_sents]
+
+X_test = [sent2features(s, word2cluster) for s in test_sents]
+y_test = [sent2labels(s) for s in test_sents]
+# %% markdown
+# ## Training
+# %% markdown
+# We now create a CRF model and train it. We'll use the standard [L-BFGS](https://en.wikipedia.org/wiki/Limited-memory_BFGS) algorithm for our parameter estimation and run it for 100 iterations. When we're done, we save the model with `joblib`.
+# %% codecell
+crf = crfsuite.CRF(
+    verbose='true',
+    algorithm='lbfgs',
+    max_iterations=100
+)
+
+crf.fit(X_train, y_train, X_dev=X_dev, y_dev=y_dev)
+# %% codecell
+import joblib
+import os
+
+OUTPUT_PATH = "models/ner/"
+OUTPUT_FILE = "crf_model"
+
+if not os.path.exists(OUTPUT_PATH):
+    os.mkdir(OUTPUT_PATH)
+
+joblib.dump(crf, os.path.join(OUTPUT_PATH, OUTPUT_FILE))
+# %% markdown
+# ## Evaluation
+# %% markdown
+# Let's evaluate the output of our CRF. We'll load the model from the output file above and have it predict labels for the full test set.
+#
+# As a sanity check, let's take a look at its predictions for the first test sentence. This output looks pretty good: the CRF is able to predict all four locations in the sentence correctly. It only misses the person entity, which is a strange case anyway, because it is not actually a person name.
+# %% codecell
+crf = joblib.load(os.path.join(OUTPUT_PATH, OUTPUT_FILE))
+y_pred = crf.predict(X_test)
+
+example_sent = test_sents[0]
+
+print("Sentence:", ' '.join(sent2tokens(example_sent)))
+print("Predicted:", ' '.join(crf.predict([sent2features(example_sent, word2cluster)])[0]))
+print("Correct:  ", ' '.join(sent2labels(example_sent)))
+# %% markdown
+# Now we evaluate on the full test set. We'll print out a classification report for all labels except `O`. If we were to include `O`, which far outnumbers the entity labels in our data, the average scores would be inflated artificially, simply because there's an inherently high probability that the `O` labels from our CRF are correct. We obtain an average F-score of 77% (micro average) across all entity types, with particularly good results for `B-LOC`and `B-PER`.
+# %% codecell
+labels = list(crf.classes_)
+labels.remove("O")
+y_pred = crf.predict(X_test)
+sorted_labels = sorted(
+    labels,
+    key=lambda name: (name[1:], name[0])
+)
+
+print(metrics.flat_classification_report(y_test, y_pred, labels=sorted_labels))
+# %% markdown
+# Now we can also look at the most likely transitions the CRF has identified, and at the top features for every label. We'll do this with the `eli5` library, which helps us explain the predictions of machine learning models.
+#
+# The top transitions are quite intuitive: the most likely transitions are those within the same entity type (from a B-label to an O-label), and those where a B-label follows an O-label.
+#
+# The features, too, make sense. For example, if a word does not start with an uppercase letter, it is unlikely to be an entity. By contrast, a word is very likely to be a location if it ends in `ië`, which is indeed a very common suffix for locations in Dutch. Notice also how informative the embedding clusters are: for all entity types, the word clusters form some of the most informative features for the CRF.
+# %% codecell
+import eli5
+
+eli5.show_weights(crf, top=30)
+# %% markdown
+# ## Finding the optimal hyperparameters
+# %% markdown
+# So far we've trained a model with the default parameters. It's unlikely that these will give us the best performance possible. Therefore we're going to search automatically for the best hyperparameter settings by iteratively training different models and evaluating them. Eventually we'll pick the best one.
+#
+# Here we'll focus on two parameters: `c1` and `c2`. These are the parameters for L1 and L2 regularization, respectively. Regularization prevents overfitting on the training data by adding a penalty to the loss function. In L1 regularization, this penalty is the sum of the absolute values of the weights; in L2 regularization, it is the sum of the squared weights. L1 regularization performs a type of feature selection, as it assigns 0 weight to irrelevant features. L2 regularization, by contrast, makes the weight of irrelevant features small, but not necessarily zero. L1 regularization is often called the Lasso method, L2 is called the Ridge method, and the linear combination of both is called Elastic Net regularization.
+#
+# We define the parameter space for c1 and c2 and use the flat F1-score to compare the individual models. We'll rely on three-fold cross validation to score each of the 50 candidates. We use a randomized search, which means we're not going to try out all specified parameter settings, but instead, we'll let the process sample randomly from the distributions we've specified in the parameter space. It will do this 50 (`n_iter`) times. This process takes a while, but it's worth the wait.
+# %% codecell
+import scipy
+from sklearn.metrics import make_scorer
+from sklearn.model_selection import RandomizedSearchCV
+
+crf = crfsuite.CRF(
+    algorithm='lbfgs',
+    max_iterations=100,
+    all_possible_transitions=True
+)
+
+params_space = {
+    'c1': scipy.stats.expon(scale=0.5),
+    'c2': scipy.stats.expon(scale=0.05),
+}
+
+f1_scorer = make_scorer(metrics.flat_f1_score,
+                        average='weighted', labels=labels)
+
+rs = RandomizedSearchCV(crf, params_space,
+                        cv=3,
+                        verbose=1,
+                        n_jobs=-1,
+                        n_iter=50,
+                        scoring=f1_scorer)
+rs.fit(X_train, y_train)
+# %% markdown
+# Let's take a look at the best hyperparameter settings. Our random search suggests a combination of L1 and L2 normalization.
+# %% codecell
+print('best params:', rs.best_params_)
+print('best CV score:', rs.best_score_)
+print('model size: {:0.2f}M'.format(rs.best_estimator_.size_ / 1000000))
+# %% markdown
+# To find out what precision, recall and F1-score this translates to, we take the best estimator from our random search and evaluate it on the test set. This indeed shows a nice improvement from our initial model. We've gone from an average F1-score of 77% to 79.1%. Both precision and recall have improved, and we see a positive result for all four entity types.
+# %% codecell
+best_crf = rs.best_estimator_
+y_pred = best_crf.predict(X_test)
+print(metrics.flat_classification_report(
+    y_test, y_pred, labels=sorted_labels, digits=3
+))
+# %% markdown
+# ## Conclusions
+# %% markdown
+# Conditional Random Fields have lost some of their popularity since the advent of neural-network models. Still, they can be very effective for named entity recognition, particularly when word embedding information is taken into account.
+# %% codecell
